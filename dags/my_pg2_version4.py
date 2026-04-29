@@ -170,6 +170,15 @@ t_availed_leaves = PythonOperator(
     dag=dag,
 )
 
+# Monthly cooldown: reset strikes for non-suspended employees (BRD requirement)
+t_monthly_cooldown = PythonOperator(
+    task_id='monthly_cooldown',
+    python_callable=run_script(
+        '/opt/airflow/scripts/kafka/monthly_cooldown.py'
+    ),
+    dag=dag,
+)
+
 skip_monthly = EmptyOperator(
     task_id='skip_monthly',
     dag=dag,
@@ -210,7 +219,7 @@ pipeline_done = EmptyOperator(
 #                                                   ▼
 #                                            monthly_check
 #                                           /             \
-#                                   run_monthly       skip_monthly
+#                             run_monthly ► cooldown   skip_monthly
 #                                           \             /
 #                                            pipeline_done
 # ─────────────────────────────────────────────────────────────
@@ -228,4 +237,5 @@ t4_employee_leaves >> [t5_dept_report, t6_leave_report]
 # Monthly branch (after daily reports)
 [t5_dept_report, t6_leave_report] >> monthly_check
 monthly_check >> [t_availed_leaves, skip_monthly]
-[t_availed_leaves, skip_monthly] >> pipeline_done
+t_availed_leaves >> t_monthly_cooldown >> pipeline_done
+skip_monthly >> pipeline_done

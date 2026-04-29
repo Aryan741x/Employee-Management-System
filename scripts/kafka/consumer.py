@@ -5,7 +5,7 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, BooleanType
 )
 from pyspark.sql.functions import (
-    col, lit, round, coalesce, udf, from_json, current_timestamp
+    col, lit, udf, from_json, current_timestamp
 )
 from datetime import datetime, timedelta
 
@@ -30,13 +30,14 @@ spark = SparkSession.builder \
     .getOrCreate()
 
 # ─────────────────────────────────────────────────────────────
-# Kafka Stream
+# Kafka Stream  –  "earliest" so first run reads ALL messages
+#                   (checkpoint overrides on subsequent runs)
 # ─────────────────────────────────────────────────────────────
 kafka_df = spark.readStream.format("kafka") \
     .option("kafka.bootstrap.servers", "kafka:9092") \
     .option("subscribe", "employee-messages") \
-    .option("startingOffsets", "latest") \
-    .option("maxOffsetsPerTrigger", 10) \
+    .option("startingOffsets", "earliest") \
+    .option("maxOffsetsPerTrigger", 500) \
     .load()
 
 # Message schema
@@ -47,13 +48,29 @@ message_schema = StructType([
 ])
 
 # ─────────────────────────────────────────────────────────────
-# FIX: absolute paths so this works inside the Docker container
+# Load ONLY marked words  (vocab removed – not needed per BRD)
 # ─────────────────────────────────────────────────────────────
-with open("/opt/airflow/data/vocab.json") as f:
-    vocab = set(json.load(f))
-
 with open("/opt/airflow/data/marked_words.json") as f:
     marked_words = set(json.load(f))
+
+print(f"Loaded {len(marked_words)} marked words.")
+
+# ─────────────────────────────────────────────────────────────
+# Pre-load salary map from gold timeframe (ACTIVE employees)
+# ─────────────────────────────────────────────────────────────
+_salary_map = {}
+try:
+    salary_df = spark.read.parquet(
+        "s3a://poc-bootcamp-capstone-project-group2/gold/employee-timeframe-opt/status=ACTIVE/"
+    ).select("emp_id", "salary")
+    _salary_map = {
+        str(row["emp_id"]): float(row["salary"])
+        for row in salary_df.collect()
+        if row["salary"] is not None
+    }
+    print(f"Loaded {len(_salary_map)} employee salaries from gold timeframe.")
+except Exception as e:
+    print(f"WARNING: Could not load salary data: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # Batch Processing  (called once per micro-batch by Spark)
@@ -69,33 +86,39 @@ def process_batch(batch_df, batch_id):
         .select(from_json(col("value"), message_schema).alias("data")) \
         .select("data.*")
 
-    # ── Flag messages containing reserved words ───────────────
+    # ── Flag messages containing ANY reserved/marked word ─────
     def is_flagged(message):
         if not message:
             return False
         words = re.findall(r'\b\w+\b', message.upper())
-        return any(w in marked_words for w in words) and all(w in vocab for w in words)
+        return any(w in marked_words for w in words)
 
     is_flagged_udf = udf(is_flagged, BooleanType())
 
     flagged_df = json_df \
         .withColumn("is_flagged", is_flagged_udf(col("message"))) \
-        .filter(col("is_flagged")) \
-        .withColumn("start_date", current_timestamp()) \
-        .select(col("sender").alias("employee_id"), "start_date")
-
-    # Keep only messages within the last 30 days
-    one_month_ago = datetime.utcnow() - timedelta(days=30)
-    flagged_df = flagged_df.filter(
-        col("start_date") >= lit(one_month_ago.strftime('%Y-%m-%d %H:%M:%S'))
-    )
+        .filter(col("is_flagged"))
 
     if flagged_df.isEmpty():
         print(f"[Batch {batch_id}] No flagged messages – skipping.")
         return
 
+    # ── Collect flagged rows ──────────────────────────────────
+    flagged_rows_raw = flagged_df.select("sender", "receiver").collect()
+    now = datetime.utcnow()
+
+    # Both sender AND receiver get a strike (BRD requirement)
+    flagged_entries = []
+    for row in flagged_rows_raw:
+        flagged_entries.append((str(row["sender"]),   now))
+        flagged_entries.append((str(row["receiver"]), now))
+
     # ── Write to LocalStack S3 (silver layer) ─────────────────
-    flagged_df.write.mode("append").parquet(
+    sender_flagged = flagged_df \
+        .withColumn("start_date", current_timestamp()) \
+        .select(col("sender").alias("employee_id"), "start_date")
+
+    sender_flagged.write.mode("append").parquet(
         "s3a://poc-bootcamp-capstone-project-group2/silver/flagged_messages/"
     )
 
@@ -109,36 +132,34 @@ def process_batch(batch_df, batch_id):
     )
     cur = conn.cursor()
 
-    flagged_rows = [(r["employee_id"], r["start_date"]) for r in flagged_df.collect()]
-
-    # Insert flagged messages log
+    # Insert flagged messages log (sender + receiver)
     execute_values(
         cur,
         "INSERT INTO flagged_messages (employee_id, start_date) VALUES %s",
-        flagged_rows,
+        flagged_entries,
     )
 
     # Aggregate new strikes per employee in this micro-batch
     strike_counts = {}
-    for employee_id, _ in flagged_rows:
+    for employee_id, _ in flagged_entries:
         strike_counts[employee_id] = strike_counts.get(employee_id, 0) + 1
-    strike_rows = [(emp_id, inc) for emp_id, inc in strike_counts.items()]
 
-    # Upsert strike counts
-    execute_values(
-        cur,
-        """
-        INSERT INTO employee_strikes (employee_id, salary, no_of_strikes)
-        VALUES %s
-        ON CONFLICT (employee_id) DO UPDATE
-        SET no_of_strikes = employee_strikes.no_of_strikes + EXCLUDED.no_of_strikes
-        """,
-        strike_rows,
-        template="(%s, NULL, %s)",
-    )
+    # Upsert strike counts WITH salary from gold timeframe
+    for emp_id, inc in strike_counts.items():
+        salary = _salary_map.get(str(emp_id))
+        cur.execute(
+            """
+            INSERT INTO employee_strikes (employee_id, salary, no_of_strikes)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (employee_id) DO UPDATE
+            SET no_of_strikes = employee_strikes.no_of_strikes + EXCLUDED.no_of_strikes,
+                salary = COALESCE(employee_strikes.salary, EXCLUDED.salary)
+            """,
+            (emp_id, salary, inc),
+        )
 
     # Recalculate salary deductions for affected employees
-    affected_ids = [row[0] for row in strike_rows]
+    affected_ids = list(strike_counts.keys())
     cur.execute(
         """
         UPDATE employee_strikes
@@ -161,7 +182,7 @@ def process_batch(batch_df, batch_id):
     )
 
     conn.commit()
-    print(f"[Batch {batch_id}] Processed {len(flagged_rows)} flagged message(s).")
+    print(f"[Batch {batch_id}] Processed {len(flagged_entries)} flagged entries (sender+receiver).")
 
     cur.close()
     conn.close()
@@ -174,7 +195,7 @@ query = kafka_df.writeStream \
     .outputMode("update") \
     .option("checkpointLocation",
             "s3a://poc-bootcamp-capstone-project-group2/gold/checkpoints/kafka-consumer/") \
-    .trigger(processingTime="30 seconds") \
+    .trigger(processingTime="10 seconds") \
     .start()
 
 print("Kafka consumer started. Listening on topic: employee-messages")
